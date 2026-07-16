@@ -18,7 +18,11 @@
     "Linux",
     "Windows"
   ],
-  "installinstructions": {},
+  "installinstructions": {
+    "Darwin": "",
+    "Linux": "",
+    "Windows": ""
+  },
   "dependencies": {},
   "version": "0.1.0",
   "author": "Alec Nunn",
