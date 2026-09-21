@@ -21,15 +21,28 @@ class Variable:
 class SymbolResolver:
     def __init__(self, model: Model, relocs: list[Reloc]) -> None:
         self._names: dict[int, str] = {}
-        # function start -> (end, name)
-        self._func_starts: list[int] = []
-        self._func_info: dict[int, tuple[int, str]] = {}
+        # Every function address RANGE, sorted by start. A function may cover
+        # several disjoint ranges (see model.Function); resolving against the
+        # outer span would claim addresses in the gaps, which belong to other
+        # functions. Each entry carries the offset of the range within the
+        # function's emitted bytes so an in-symbol addend stays correct.
+        self._range_starts: list[int] = []
+        self._range_info: dict[int, tuple[int, str, int]] = {}  # start -> (end, name, base_off)
+        self._func_starts: set[int] = set()
         for f in model.functions:
-            self._func_info[f.start] = (f.end, f.name)
+            self._func_starts.add(f.start)
             self._names.setdefault(f.start, f.name)
+            # Offsets are relative to the ENTRY point, which is where the
+            # function's symbol is defined, so an address inside the function
+            # resolves to "name + addend" with addend 0 at the entry.
+            entry_off = f.entry_offset()
+            off = 0
+            for start, end in f.ranges:
+                self._range_info[start] = (end, f.name, off - entry_off)
+                off += end - start
         for s in model.symbols:
             self._names[s.addr] = s.name
-        self._func_starts = sorted(self._func_info)
+        self._range_starts = sorted(self._range_info)
 
         def section_range(cls: SegClass) -> tuple[int, int] | None:
             # Returns only the FIRST segment of the given class: section-relative
@@ -52,7 +65,7 @@ class SymbolResolver:
 
         self.variables: dict[int, Variable] = {}
         for s in model.symbols:
-            if s.is_func or s.addr in self._func_info:
+            if s.is_func or s.addr in self._func_starts:
                 continue
             if in_data(s.addr):
                 self.variables[s.addr] = Variable(s.name, s.public)
@@ -66,13 +79,13 @@ class SymbolResolver:
         return self._relocs_sorted[lo:hi]
 
     def _resolve_in_func(self, va: int) -> tuple[str, int] | None:
-        idx = bisect.bisect_right(self._func_starts, va) - 1
+        idx = bisect.bisect_right(self._range_starts, va) - 1
         if idx < 0:
             return None
-        start = self._func_starts[idx]
-        end, name = self._func_info[start]
+        start = self._range_starts[idx]
+        end, name, base_off = self._range_info[start]
         if va < end:
-            return (name, va - start)
+            return (name, base_off + (va - start))
         return None
 
     def resolve_code(self, va: int) -> tuple[str, int] | None:

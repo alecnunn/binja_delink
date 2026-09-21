@@ -43,6 +43,34 @@ def generate_default(model: Model, ext: str) -> Groups:
     return groups
 
 
+def retarget_extensions(groups: Groups, ext: str) -> "tuple[Groups, list[str]]":
+    """Rewrite each output filename's extension to ``ext``.
+
+    A grouping file bakes in the extension that was current when it was
+    generated (``.obj`` for COFF, ``.o`` for ELF). Reusing it after the output
+    format changed would otherwise write, say, ELF objects into ``.obj`` files.
+    Returns the retargeted grouping plus one warning per renamed file.
+    """
+    out: Groups = {}
+    warnings: list[str] = []
+    for filename, syms in groups.items():
+        stem, dot, old_ext = filename.rpartition(".")
+        if not dot or "/" in old_ext or "\\" in old_ext:
+            stem, old_ext = filename, ""
+        new_name = f"{stem}.{ext}"
+        if new_name != filename:
+            warnings.append(
+                f"grouping entry {filename!r} renamed to {new_name!r} to match the "
+                f"requested output format")
+        if new_name in out:
+            # Two grouping keys collapsed onto one filename; keep them apart.
+            warnings.append(f"grouping entries collide on {new_name!r}; keeping {filename!r}")
+            out[filename] = syms
+            continue
+        out[new_name] = syms
+    return out, warnings
+
+
 def save(groups: Groups, path: str) -> None:
     # Byte-identical to delink's idapro.json (serde_json to_string_pretty):
     # object keys and symbol keys sorted, but each SymbolDef's fields kept in
@@ -54,8 +82,11 @@ def save(groups: Groups, path: str) -> None:
               for name, d in sorted(syms.items())}
         for obj, syms in sorted(groups.items())
     }
+    # ensure_ascii=False: serde_json writes raw UTF-8, so escaping non-ASCII
+    # symbol names as \uXXXX here would break that byte compatibility. The file
+    # is already opened as UTF-8.
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(serializable, fh, indent=2)
+        json.dump(serializable, fh, indent=2, ensure_ascii=False)
 
 
 def load(path: str) -> Groups:
