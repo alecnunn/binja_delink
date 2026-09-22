@@ -72,3 +72,42 @@ def test_a_symbol_outside_the_first_section_of_its_class_is_still_a_variable():
                   functions=[], symbols=[table], relocations=[])
     resolver = SymbolResolver(model, [])
     assert 0x4020 in resolver.variables
+
+
+def test_an_unambiguous_name_wins_where_symbols_share_an_address():
+    # A PE import puts the thunk, the IAT slot and the imported name at
+    # overlapping addresses under one name; __imp_X identifies exactly one.
+    syms = [Symbol(0x2000, "__imp_GetLastError", public=True),
+            Symbol(0x2000, "GetLastError", public=True),
+            Symbol(0x1500, "GetLastError", public=True)]
+    model = Model(arch=Arch.X86_64, bits=64, little_endian=True, image_base=0x1000,
+                  filetype="PE", input_file="sample", sections=[TEXT, DATA],
+                  functions=[], symbols=syms, relocations=[])
+    assert SymbolResolver(model, []).resolve_data(0x2000) == ("__imp_GetLastError", 0)
+
+
+def test_a_name_used_at_several_addresses_is_never_the_relocation_target():
+    # A PLT stub and its GOT slot are both called __libc_start_main. Writing a
+    # relocation against that name lets it bind to the stub's own definition,
+    # so the stub jumps to itself; the section-relative symbol is used instead.
+    stub = Function(0x1030, 0x1036, "__libc_start_main")
+    syms = [Symbol(0x1030, "__libc_start_main", public=True),
+            Symbol(0x2040, "__libc_start_main", public=True)]
+    model = Model(arch=Arch.X86_64, bits=64, little_endian=True, image_base=0x1000,
+                  filetype="ELF", input_file="sample", sections=[TEXT, DATA],
+                  functions=[stub], symbols=syms, relocations=[])
+    assert SymbolResolver(model, []).resolve_data(0x2040) == (DATA_START, 0x40)
+
+
+def test_a_variable_is_defined_under_the_name_relocations_use():
+    # The definition and the reference have to agree, or the shared object
+    # defines one name while every relocation asks for another.
+    syms = [Symbol(0x2000, "__imp_Sleep", public=True),
+            Symbol(0x2000, "Sleep", public=True),
+            Symbol(0x1500, "Sleep", public=True)]
+    model = Model(arch=Arch.X86_64, bits=64, little_endian=True, image_base=0x1000,
+                  filetype="PE", input_file="sample", sections=[TEXT, DATA],
+                  functions=[], symbols=syms, relocations=[])
+    resolver = SymbolResolver(model, [])
+    assert resolver.variables[0x2000].name == "__imp_Sleep"
+    assert resolver.resolve_data(0x2000) == ("__imp_Sleep", 0)

@@ -39,6 +39,33 @@ def section_start_symbols(sections) -> "dict[int, str]":
     return out
 
 
+def preferred_names(symbols) -> "dict[int, str]":
+    """The name to use for each address, where several symbols share one.
+
+    A PE import collides three ways: the thunk, its IAT slot and the imported
+    name can all be called ``GetLastError``, and the bare name occurs at
+    several addresses. Relocating against an ambiguous name lets the linker
+    bind it to whichever definition is nearest -- an import thunk relocated
+    against its own name jumps to itself -- so a name that identifies exactly
+    one address wins over one reused across several (``__imp_GetLastError``
+    over ``GetLastError``). Among names of equal standing the last wins, which
+    is what this did before.
+    """
+    addrs_by_name: dict[str, set] = {}
+    for sym in symbols:
+        addrs_by_name.setdefault(sym.name, set()).add(sym.addr)
+
+    def ambiguous(name: str) -> int:
+        return 0 if len(addrs_by_name[name]) == 1 else 1
+
+    chosen: dict[int, str] = {}
+    for sym in symbols:
+        current = chosen.get(sym.addr)
+        if current is None or ambiguous(sym.name) <= ambiguous(current):
+            chosen[sym.addr] = sym.name
+    return chosen
+
+
 @dataclass
 class Variable:
     name: str
@@ -67,8 +94,17 @@ class SymbolResolver:
             for start, end in f.ranges:
                 self._range_info[start] = (end, f.name, off - entry_off)
                 off += end - start
-        for s in model.symbols:
-            self._names[s.addr] = s.name
+        self._preferred = preferred_names(model.symbols)
+        self._names.update(self._preferred)
+        # Names that occur at more than one address identify none of them. A
+        # relocation written against one binds to whichever definition the
+        # linker sees first -- for an import thunk or a PLT stub, its own --
+        # so these are never used as a relocation target; an address-derived
+        # symbol is used instead.
+        addrs: dict[str, set] = {}
+        for sym in model.symbols:
+            addrs.setdefault(sym.name, set()).add(sym.addr)
+        self._ambiguous = {n for n, a in addrs.items() if len(a) > 1}
         self._range_starts = sorted(self._range_info)
 
         # Every data-bearing section, each with its own start symbol. Keyed on
@@ -83,12 +119,14 @@ class SymbolResolver:
         def in_data(va: int) -> bool:
             return any(s.contains(va) for s in self._data_sections)
 
+        # Defined under the same name relocations are written against, or the
+        # definition and the reference would not meet.
         self.variables: dict[int, Variable] = {}
         for s in model.symbols:
             if s.is_func or s.addr in self._func_starts:
                 continue
             if in_data(s.addr):
-                self.variables[s.addr] = Variable(s.name, s.public)
+                self.variables[s.addr] = Variable(self._preferred[s.addr], s.public)
 
         self._relocs_sorted: list[Reloc] = sorted(relocs, key=lambda r: r.addr)
         self._reloc_addrs: list[int] = [r.addr for r in self._relocs_sorted]
@@ -108,14 +146,23 @@ class SymbolResolver:
             return (name, base_off + (va - start))
         return None
 
+    def _unambiguous_name(self, va: int) -> "str | None":
+        name = self._names.get(va)
+        return name if name is not None and name not in self._ambiguous else None
+
     def resolve_code(self, va: int) -> tuple[str, int] | None:
-        if va in self._names:
-            return (self._names[va], 0)
-        return self._resolve_in_func(va)
+        name = self._unambiguous_name(va)
+        if name is not None:
+            return (name, 0)
+        in_func = self._resolve_in_func(va)
+        if in_func is not None:
+            return in_func
+        return (self._names[va], 0) if va in self._names else None
 
     def resolve_data(self, va: int) -> tuple[str, int] | None:
-        if va in self._names:
-            return (self._names[va], 0)
+        name = self._unambiguous_name(va)
+        if name is not None:
+            return (name, 0)
         in_func = self._resolve_in_func(va)
         if in_func is not None:
             return in_func
@@ -124,4 +171,4 @@ class SymbolResolver:
         for sec in self._data_sections:
             if sec.contains(va):
                 return (self._section_symbols[sec.start], va - sec.start)
-        return None
+        return (self._names[va], 0) if va in self._names else None
