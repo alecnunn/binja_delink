@@ -13,6 +13,8 @@ from binja_delink.objwrite.aarch64 import (
 from binja_delink.objwrite.relocs import RelocKind
 from binja_delink.recover.interface import RecoveredReloc
 
+_PAGE_MASK = ~0xFFF
+
 _LDST_KIND_BY_SCALE = {
     0: RelocKind.AARCH64_LDST8_ABS_LO12_NC,
     1: RelocKind.AARCH64_LDST16_ABS_LO12_NC,
@@ -20,8 +22,6 @@ _LDST_KIND_BY_SCALE = {
     3: RelocKind.AARCH64_LDST64_ABS_LO12_NC,
     4: RelocKind.AARCH64_LDST128_ABS_LO12_NC,
 }
-
-_PAGE_MASK = ~0xFFF
 
 
 def aarch64_branch_reloc(instr_word: int, is_call: bool) -> "RecoveredReloc | None":
@@ -37,6 +37,24 @@ def aarch64_branch_reloc(instr_word: int, is_call: bool) -> "RecoveredReloc | No
 
 def _is_adr_family(word: int) -> bool:
     return (word >> 24) & 0x1F == 0b10000
+
+
+def is_adrp(word: int) -> bool:
+    """ADRP -- the page-base half of an ADRP/ADD or ADRP/LDR pair."""
+    return _is_adr_family(word) and bool(word >> 31)
+
+
+def adrp_page(word: int, instr_addr: int) -> int:
+    """The page ``ADRP`` at ``instr_addr`` materializes."""
+    return (instr_addr & _PAGE_MASK) + (get_imm21(word) << 12)
+
+
+def dest_reg(word: int) -> int:
+    return word & 0x1F
+
+
+def base_reg(word: int) -> int:
+    return (word >> 5) & 0x1F
 
 
 def _is_add_imm(word: int) -> bool:

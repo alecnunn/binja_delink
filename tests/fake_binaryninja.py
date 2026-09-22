@@ -105,6 +105,24 @@ class Architecture:
         return self._instructions.get(addr)
 
 
+class IndirectBranchInfo:
+    def __init__(self, source_addr: int, dest_addr: int) -> None:
+        self.source_addr = source_addr
+        self.dest_addr = dest_addr
+
+
+class ArrayType:
+    def __init__(self, element_width: int, count: int) -> None:
+        self.element_type = types.SimpleNamespace(width=element_width)
+        self.count = count
+
+
+class DataVariable:
+    def __init__(self, address: int, type_) -> None:
+        self.address = address
+        self.type = type_
+
+
 class BasicBlock:
     def __init__(self, start: int, end: int) -> None:
         self.start = start
@@ -113,13 +131,15 @@ class BasicBlock:
 
 class Function:
     def __init__(self, start: int, ranges, name: str, arch: Architecture,
-                 binding: SymbolBinding = SymbolBinding.LocalBinding, blocks=None) -> None:
+                 binding: SymbolBinding = SymbolBinding.LocalBinding, blocks=None,
+                 indirect_branches=()) -> None:
         self.start = start
         self.name = name
         self.arch = arch
         self.address_ranges = [AddressRange(s, e) for s, e in ranges]
         self.symbol = Symbol(start, name, binding)
         self.basic_blocks = [BasicBlock(s, e) for s, e in (blocks or ranges)]
+        self.indirect_branches = [IndirectBranchInfo(s, d) for s, d in indirect_branches]
 
 
 class BinaryViewFile:
@@ -132,6 +152,7 @@ class BinaryView:
 
     def __init__(self, arch: Architecture, memory: dict, functions=(), symbols=(),
                  segments=(), relocation_ranges=(), relocations=None, data_refs=None,
+                 code_refs=None, data_vars=None,
                  view_type: str = "PE", start: int = 0x1000) -> None:
         self.arch = arch
         self._memory = memory          # {address: bytes}
@@ -140,7 +161,12 @@ class BinaryView:
         self.segments = list(segments)
         self.relocation_ranges = list(relocation_ranges)
         self._relocations = relocations or {}
+        # Mirrors the real core's split: a reference originating at an
+        # INSTRUCTION is a code reference even when its target is data;
+        # _data_refs is the data-to-data direction only.
         self._data_refs = data_refs or {}
+        self._code_refs = code_refs or {}
+        self._data_vars = data_vars or {}
         self.view_type = view_type
         self.start = start
         self.file = BinaryViewFile("sample.bin")
@@ -159,6 +185,12 @@ class BinaryView:
 
     def get_data_refs_from(self, addr: int):
         return list(self._data_refs.get(addr, ()))
+
+    def get_code_refs_from(self, addr: int, func=None):
+        return list(self._code_refs.get(addr, ()))
+
+    def get_data_var_at(self, addr: int):
+        return self._data_vars.get(addr)
 
     def relocations_at(self, addr: int):
         return [Relocation(info) for info in self._relocations.get(addr, ())]
@@ -191,6 +223,8 @@ def install() -> types.ModuleType:
     binaryview = types.ModuleType("binaryninja.binaryview")
     binaryview.BinaryView = BinaryView
     binaryview.Segment = Segment
+    module.ArrayType = ArrayType
+    module.DataVariable = DataVariable
     function = types.ModuleType("binaryninja.function")
     function.Function = Function
     module.binaryview = binaryview

@@ -73,7 +73,7 @@ def test_both_fields_of_one_instruction_get_a_relocation():
         arch_name="x86", address_size=4,
         instructions={0x1000: InstructionInfo(len(instr))},
         memory={0x1000: instr},
-        data_refs={0x1000: [0x404000]},
+        code_refs={0x1000: [0x404000]},
         segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
     func = fake_binaryninja.Function(0x1000, [(0x1000, 0x100A)], "f", arch)
     bv.functions.append(func)
@@ -110,7 +110,7 @@ def test_aarch64_data_references_are_recovered():
         arch_name="aarch64",
         instructions={0x401000: InstructionInfo(4), 0x401004: InstructionInfo(4)},
         memory={0x401000: text},
-        data_refs={0x401000: [0x404010], 0x401004: [0x404010]},
+        code_refs={0x401000: [0x404010], 0x401004: [0x404010]},
         segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
     bv.functions.append(fake_binaryninja.Function(0x401000, [(0x401000, 0x401008)], "f", arch))
     model = binja_adapter.build_model(bv)
@@ -130,7 +130,7 @@ def test_recovered_offsets_are_relative_to_the_emitted_bytes():
         arch_name="x86", address_size=4,
         instructions={0x1080: InstructionInfo(len(instr))},
         memory={0x1000: b"\x90" * 16, 0x1080: instr},
-        data_refs={0x1080: [0x404000]},
+        code_refs={0x1080: [0x404000]},
         segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
     func = fake_binaryninja.Function(
         0x1000, [(0x1000, 0x1010), (0x1080, 0x108A)], "f", arch, blocks=[(0x1080, 0x108A)])
@@ -139,3 +139,91 @@ def test_recovered_offsets_are_relative_to_the_emitted_bytes():
     data = b"\x90" * 16 + instr
     recovered = binja_adapter.make_recover_fn(bv, model)(model.functions[0], data)
     assert [r.offset for r in recovered] == [0x10 + 2, 0x10 + 6]
+
+
+def test_a_reference_reported_only_as_a_code_ref_is_recovered():
+    # Regression for the data-reference path querying get_data_refs_from on a
+    # code address: the core files a reference originating at an INSTRUCTION
+    # under code refs, so a recovery that only consults data refs sees nothing
+    # and silently emits no relocation at all.
+    instr = bytes.fromhex("c705") + (0x404000).to_bytes(4, "little") * 2
+    bv, arch = make_bv(
+        arch_name="x86", address_size=4,
+        instructions={0x1000: InstructionInfo(len(instr))},
+        memory={0x1000: instr},
+        code_refs={0x1000: [0x404000]},
+        data_refs={},                      # nothing here, as for a real code address
+        segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
+    bv.functions.append(fake_binaryninja.Function(0x1000, [(0x1000, 0x100A)], "f", arch))
+    model = binja_adapter.build_model(bv)
+    recovered = binja_adapter.make_recover_fn(bv, model)(model.functions[0], instr)
+    assert [r.kind for r in recovered] == [RelocKind.ABS32, RelocKind.ABS32]
+
+
+def test_an_absolute_reference_narrower_than_a_pointer_is_found_on_a_64_bit_image():
+    # x86_64 `add eax, [rdi*4 + 0x404040]`: the address is a 32-bit ModRM
+    # displacement. Searching only at pointer width can never match inside a
+    # 7-byte instruction, so this used to come back with no relocation.
+    instr = bytes.fromhex("0304bd") + (0x404040).to_bytes(4, "little")
+    bv, arch = make_bv(
+        instructions={0x401000: InstructionInfo(len(instr))},
+        memory={0x401000: instr},
+        code_refs={0x401000: [0x404040]},
+        segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
+    bv.functions.append(fake_binaryninja.Function(0x401000, [(0x401000, 0x401007)], "f", arch))
+    model = binja_adapter.build_model(bv)
+    recovered = binja_adapter.make_recover_fn(bv, model)(model.functions[0], instr)
+    assert [(r.offset, r.kind, r.width) for r in recovered] == [(3, RelocKind.ABS32, 4)]
+
+
+def test_one_relocation_reported_twice_at_an_address_is_emitted_once():
+    info = RelocationInfo(size=8, target=0x401000, addend=0)
+    bv, _arch = make_bv(
+        memory={0x2000: b"\x00" * 16},
+        relocation_ranges=[(0x2000, 0x2008)],
+        relocations={0x2000: [info, info]})
+    assert len(binja_adapter._read_relocations(bv, ptr_size=8)) == 1
+
+
+def test_an_adrp_with_no_reported_reference_is_paired_with_its_consumer():
+    # Binary Ninja files the pair's reference on the ADD/LDR that supplies the
+    # low 12 bits and often reports nothing at all for the ADRP. The page an
+    # ADRP names is usually in no section either, so both the target and the
+    # section test have to come from the consumer.
+    adrp = set_imm21(0x9000000C, 3)               # adrp x12, 0x404000 from 0x401000
+    add = set_imm12(0x9100018C, 0x380)            # add x12, x12, #0x380
+    text = struct.pack("<II", adrp, add)
+    bv, arch = make_bv(
+        arch_name="aarch64",
+        instructions={0x401000: InstructionInfo(4), 0x401004: InstructionInfo(4)},
+        memory={0x401000: text},
+        code_refs={0x401004: [0x404380]},         # nothing reported at the ADRP
+        segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
+    bv.functions.append(fake_binaryninja.Function(0x401000, [(0x401000, 0x401008)], "f", arch))
+    model = binja_adapter.build_model(bv)
+    recovered = binja_adapter.make_recover_fn(bv, model)(model.functions[0], text)
+    assert [(r.offset, r.kind, r.target_va) for r in recovered] == [
+        (0, RelocKind.AARCH64_ADR_PREL_PG_HI21, 0x404380),
+        (4, RelocKind.AARCH64_ADD_ABS_LO12_NC, 0x404380),
+    ]
+
+
+def test_an_adrp_is_paired_across_a_basic_block_boundary():
+    # "adrp x12, P / b.lt / ... / ldr [x12, #off]" is routine: resetting the
+    # pairing state per basic block loses the page base entirely.
+    adrp = set_imm21(0x9000000C, 3)
+    add = set_imm12(0x9100018C, 0x380)
+    text = struct.pack("<III", adrp, 0xD503201F, add)   # adrp / nop / add
+    bv, arch = make_bv(
+        arch_name="aarch64",
+        instructions={a: InstructionInfo(4) for a in (0x401000, 0x401004, 0x401008)},
+        memory={0x401000: text},
+        code_refs={0x401008: [0x404380]},
+        segments=[fake_binaryninja.Segment(0x404000, 0x405000, True, True, False, 0x1000)])
+    bv.functions.append(fake_binaryninja.Function(
+        0x401000, [(0x401000, 0x40100C)], "f", arch,
+        blocks=[(0x401000, 0x401008), (0x401008, 0x40100C)]))   # split before the ADD
+    model = binja_adapter.build_model(bv)
+    recovered = binja_adapter.make_recover_fn(bv, model)(model.functions[0], text)
+    assert (0, RelocKind.AARCH64_ADR_PREL_PG_HI21, 0x404380) in [
+        (r.offset, r.kind, r.target_va) for r in recovered]

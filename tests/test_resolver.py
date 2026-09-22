@@ -44,3 +44,31 @@ def test_relocations_are_queried_by_range():
     resolver = make_resolver([], relocs=relocs)
     assert [r.addr for r in resolver.relocs_in(0x2000, 0x2010)] == [0x2000]
     assert [r.addr for r in resolver.relocs_in(0x2000, 0x2100)] == [0x2000, 0x2020]
+
+
+def test_a_second_section_of_a_class_gets_its_own_start_symbol():
+    # Images with several CONST segments (a PE carrying debug sections, say)
+    # used to resolve every one of them against the first, so an address in
+    # the second became an offset from the wrong base and was dropped or,
+    # worse, silently pointed elsewhere.
+    const_a = Section("const_a", 0x3000, 0x3100, True, False, False, SegClass.CONST)
+    const_b = Section("const_b", 0x4000, 0x4100, True, False, False, SegClass.CONST)
+    model = Model(arch=Arch.X86_64, bits=64, little_endian=True, image_base=0x1000,
+                  filetype="PE", input_file="sample",
+                  sections=[TEXT, DATA, const_a, const_b],
+                  functions=[], symbols=[], relocations=[])
+    resolver = SymbolResolver(model, [])
+    assert resolver.resolve_data(0x3040) == ("__delink_const_start", 0x40)
+    assert resolver.resolve_data(0x4040) == ("__delink_const_start_4000", 0x40)
+
+
+def test_a_symbol_outside_the_first_section_of_its_class_is_still_a_variable():
+    const_a = Section("const_a", 0x3000, 0x3100, True, False, False, SegClass.CONST)
+    const_b = Section("const_b", 0x4000, 0x4100, True, False, False, SegClass.CONST)
+    table = Symbol(0x4020, "jump_table_4020", public=False)
+    model = Model(arch=Arch.X86_64, bits=64, little_endian=True, image_base=0x1000,
+                  filetype="PE", input_file="sample",
+                  sections=[TEXT, DATA, const_a, const_b],
+                  functions=[], symbols=[table], relocations=[])
+    resolver = SymbolResolver(model, [])
+    assert 0x4020 in resolver.variables

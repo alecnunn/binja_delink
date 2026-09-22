@@ -30,6 +30,10 @@ from the plugin manager in Binary Ninja.
 | x86 (i386) | COFF, ELF32 (REL) | ELF32 stores addends in the section data |
 | AArch64 | COFF, ELF64 (RELA) | `B`/`BL`, `ADRP`+`ADD`, `ADR`, `LDR` literal, and `LDR`/`STR` page offsets |
 
+An `ADRP` is relocated against the address its paired `ADD`/`LDR` reaches,
+matched up by register: Binary Ninja reports only the page at the `ADRP`, and
+often reports nothing there at all.
+
 The output format follows the input view (PE goes to COFF, ELF and Mach-O go to
 ELF) unless `delink.outputFormat` overrides it. Grouping filenames are
 retargeted to the format's extension (`.obj` or `.o`) when the two disagree.
@@ -50,9 +54,12 @@ how the output links.
 - A symbol defined by two different objects (same-named statics in different
   translation units) is reported, not renamed: the grouping schema is keyed by
   name and cannot express the distinction.
-- Section-relative fallback symbols (`__delink_data_start` and friends) assume
-  one segment per class; images with several DATA segments resolve against the
-  first.
+- Jump tables are recovered from Binary Ninja's indirect-branch records.
+  Absolute tables (x86/x86_64) get a relocation per entry; the self-relative
+  forms (PE's 32-bit offsets from the table base, AArch64's byte offsets from a
+  label inside the function) are position-independent and are left untouched.
+  A table Binary Ninja does not recognise as an indirect branch is not
+  recovered.
 
 # Development
 

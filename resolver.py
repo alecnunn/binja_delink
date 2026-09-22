@@ -11,6 +11,33 @@ DATA_START = "__delink_data_start"
 CONST_START = "__delink_const_start"
 BSS_START = "__delink_bss_start"
 
+_CLASS_START_SYMBOL = {
+    SegClass.DATA: DATA_START,
+    SegClass.CONST: CONST_START,
+    SegClass.BSS: BSS_START,
+}
+
+
+def section_start_symbols(sections) -> "dict[int, str]":
+    """Start-symbol name for every data-bearing section, keyed by section start.
+
+    The first section of a class keeps the bare name, so output for the usual
+    one-segment-per-class image is unchanged. Any further section of the same
+    class gets its address appended: one symbol cannot describe two sections,
+    and a reference into the second would otherwise be written as an offset
+    from the first -- landing wherever that arithmetic happens to point. Images
+    with many CONST segments (a PE with debug sections, say) hit this for real.
+    """
+    out: dict[int, str] = {}
+    seen: set = set()
+    for sec in sections:
+        base = _CLASS_START_SYMBOL.get(sec.seg_class)
+        if base is None:
+            continue
+        out[sec.start] = base if sec.seg_class not in seen else f"{base}_{sec.start:x}"
+        seen.add(sec.seg_class)
+    return out
+
 
 @dataclass
 class Variable:
@@ -44,24 +71,17 @@ class SymbolResolver:
             self._names[s.addr] = s.name
         self._range_starts = sorted(self._range_info)
 
-        def section_range(cls: SegClass) -> tuple[int, int] | None:
-            # Returns only the FIRST segment of the given class: section-relative
-            # fallback addends (see resolve_data below) assume one segment per
-            # class. Images with multiple same-class segments (e.g. more than
-            # one DATA segment) will resolve fallback addends against the first
-            # one only -- a documented limitation, not handled here.
-            for s in model.sections:
-                if s.seg_class == cls:
-                    return (s.start, s.end)
-            return None
-
-        self._data_range: tuple[int, int] | None = section_range(SegClass.DATA)
-        self._const_range: tuple[int, int] | None = section_range(SegClass.CONST)
-        self._bss_range: tuple[int, int] | None = section_range(SegClass.BSS)
+        # Every data-bearing section, each with its own start symbol. Keyed on
+        # the first section of a class alone, a symbol in a second CONST
+        # segment -- a jump table, typically -- is never collected and never
+        # defined, so every reference to it links as undefined; and a
+        # section-relative fallback addend is measured from the wrong base.
+        self._data_sections = [s for s in model.sections
+                               if s.seg_class in (SegClass.DATA, SegClass.CONST, SegClass.BSS)]
+        self._section_symbols = section_start_symbols(model.sections)
 
         def in_data(va: int) -> bool:
-            return any(rng is not None and rng[0] <= va < rng[1]
-                       for rng in (self._data_range, self._const_range, self._bss_range))
+            return any(s.contains(va) for s in self._data_sections)
 
         self.variables: dict[int, Variable] = {}
         for s in model.symbols:
@@ -99,9 +119,9 @@ class SymbolResolver:
         in_func = self._resolve_in_func(va)
         if in_func is not None:
             return in_func
-        for rng, sym in ((self._data_range, DATA_START),
-                         (self._const_range, CONST_START),
-                         (self._bss_range, BSS_START)):
-            if rng is not None and rng[0] <= va < rng[1]:
-                return (sym, va - rng[0])
+        # Section-relative fallback, against the section actually holding the
+        # address rather than the first one of its class.
+        for sec in self._data_sections:
+            if sec.contains(va):
+                return (self._section_symbols[sec.start], va - sec.start)
         return None

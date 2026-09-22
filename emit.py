@@ -13,7 +13,7 @@ from binja_delink.objwrite.objfile import (
 )
 from binja_delink.objwrite.relocs import AARCH64_KINDS, RelocKind, supported
 from binja_delink.recover.interface import RecoveredReloc
-from binja_delink.resolver import BSS_START, CONST_START, DATA_START, SymbolResolver
+from binja_delink.resolver import SymbolResolver, section_start_symbols
 
 BytesFn = Callable[[int, int], "bytes | None"]
 RecoverFn = Callable[[Function, bytes], "list[RecoveredReloc]"]
@@ -252,16 +252,17 @@ def emit_shared(model: Model, resolver: SymbolResolver,
     stats = EmitStats(objects=1)
     builder = _Builder(model.arch)
     class_meta = {
-        SegClass.DATA: (ObjSectionKind.DATA, ".data", DATA_START),
-        SegClass.CONST: (ObjSectionKind.RDATA, ".rdata", CONST_START),
-        SegClass.BSS: (ObjSectionKind.BSS, ".bss", BSS_START),
+        SegClass.DATA: (ObjSectionKind.DATA, ".data"),
+        SegClass.CONST: (ObjSectionKind.RDATA, ".rdata"),
+        SegClass.BSS: (ObjSectionKind.BSS, ".bss"),
     }
-    start_done: set = set()
+    # One start symbol per section, not per class: see section_start_symbols.
+    start_symbols = section_start_symbols(model.sections)
 
     for sec in model.sections:
         if sec.seg_class not in class_meta:
             continue
-        kind, sec_name, start_sym = class_meta[sec.seg_class]
+        kind, sec_name = class_meta[sec.seg_class]
         if kind == ObjSectionKind.BSS:
             sidx = builder.add_section(ObjSection(sec_name, kind, b"", bss_size=sec.size()))
         else:
@@ -299,9 +300,9 @@ def emit_shared(model: Model, resolver: SymbolResolver,
                 builder.stage_reloc(sidx, off, sym_name, addend, kind_r, 0)
                 stats.relocations += 1
 
-        if start_sym not in start_done:
+        start_sym = start_symbols.get(sec.start)
+        if start_sym is not None and not builder.defines(start_sym):
             builder.define_symbol(start_sym, sidx, 0, True, False)
-            start_done.add(start_sym)
 
         for va, var in list(resolver.variables.items()):
             if sec.contains(va):
