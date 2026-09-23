@@ -5,10 +5,13 @@ from __future__ import annotations
 import struct
 
 from binja_delink.model import Arch
+from binja_delink.objwrite import aarch64
 from binja_delink.objwrite.objfile import (
     ObjectImage, ObjSectionKind,
 )
-from binja_delink.objwrite.relocs import RelocKind, coff_machine, coff_reloc_type
+from binja_delink.objwrite.relocs import (
+    AARCH64_KINDS, RelocKind, coff_machine, coff_reloc_type,
+)
 
 # Section characteristics.
 _SCN_CNT_CODE = 0x00000020
@@ -55,8 +58,14 @@ def write_coff(image: ObjectImage) -> bytes:
         if r.offset + w > len(buf):
             raise ValueError(
                 f"reloc offset {r.offset}+{w} exceeds section {r.section_index} size {len(buf)}")
-        if r.kind in (RelocKind.AARCH64_CALL26, RelocKind.AARCH64_JUMP26):
-            continue  # imm bits live in the instruction word; the linker patches them
+        if r.kind in AARCH64_KINDS:
+            # The immediate is split across instruction-word bitfields, and the
+            # linker adds the symbol to whatever those bits hold -- so the old
+            # displacement has to go and the addend has to be encoded there.
+            word = struct.unpack_from("<I", buf, r.offset)[0]
+            struct.pack_into("<I", buf, r.offset,
+                             aarch64.set_addend(word, r.kind, r.addend) & 0xFFFFFFFF)
+            continue
         mask = (1 << (w * 8)) - 1
         struct.pack_into("<I" if w == 4 else "<Q", buf, r.offset, r.addend & mask)
 

@@ -62,16 +62,28 @@ def run_split(bv: BinaryView, out_dir: str, fmt: str) -> str:
     bytes_fn = binja_adapter.make_bytes_fn(bv)
     recover_fn = binja_adapter.make_recover_fn(bv, model)
 
+    # Write the grouping with the extensions the objects will actually use, so
+    # the JSON left next to them describes what was written.
+    groups, renames = grouping.retarget_extensions(groups, ext)
+    for message in renames:
+        binaryninja.log_warn(f"delink: {message}")
+
     os.makedirs(out_dir, exist_ok=True)
     grouping.save(groups, os.path.join(out_dir, grouping.CONFIG_FILENAME))
 
     writer = write_coff if fmt == "coff" else write_elf
-    count = 0
-    for filename, image in emit.split(model, resolver, groups, bytes_fn, recover_fn, fmt):
+    images, stats = emit.split(model, resolver, groups, bytes_fn, recover_fn, fmt)
+    for filename, image in images:
         with open(os.path.join(out_dir, filename), "wb") as fh:
             fh.write(writer(image))
-        count += 1
-    return f"delink: wrote {count} objects to {out_dir}"
+
+    # Anything dropped along the way changes how the output links, so it is
+    # reported rather than counted silently.
+    for message in stats.warnings:
+        binaryninja.log_warn(f"delink: {message}")
+    if stats.suppressed_warnings:
+        binaryninja.log_warn(f"delink: {stats.suppressed_warnings} further warnings suppressed")
+    return f"delink: wrote {len(images)} objects to {out_dir} ({stats.summary()})"
 
 
 class _SplitTask(BackgroundTaskThread):

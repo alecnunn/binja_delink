@@ -1,17 +1,29 @@
-"""Minimal 64-bit little-endian ELF ET_REL writer with RELA relocations."""
+"""Minimal little-endian ELF ET_REL writer.
+
+64-bit targets (x86_64, aarch64) get an ELFCLASS64 object with RELA
+relocations. i386 gets an ELFCLASS32 object with REL relocations and addends
+stored in the section data, which is what the i386 psABI (and every linker
+that accepts EM_386) requires -- an ELFCLASS64 header claiming EM_386 is
+rejected outright.
+"""
 
 from __future__ import annotations
 
 import struct
 
+from binja_delink.model import Arch
+from binja_delink.objwrite import aarch64
 from binja_delink.objwrite.objfile import ObjectImage, ObjSectionKind
-from binja_delink.objwrite.relocs import RelocKind, elf_machine, elf_reloc_type
+from binja_delink.objwrite.relocs import (
+    AARCH64_KINDS, RelocKind, elf_machine, elf_reloc_type,
+)
 
 _SHT_PROGBITS = 1
 _SHT_SYMTAB = 2
 _SHT_STRTAB = 3
 _SHT_RELA = 4
 _SHT_NOBITS = 8
+_SHT_REL = 9
 
 _SHF_WRITE = 0x1
 _SHF_ALLOC = 0x2
@@ -23,6 +35,9 @@ _STB_GLOBAL = 1
 _STT_FUNC = 2
 _STT_OBJECT = 1
 _STT_NOTYPE = 0
+
+_ELFCLASS32 = 1
+_ELFCLASS64 = 2
 
 _SECTION_FLAGS = {
     ObjSectionKind.TEXT: (_SHT_PROGBITS, _SHF_ALLOC | _SHF_EXEC),
@@ -53,6 +68,10 @@ def _pcrel_addend(addend: int, trailing: int) -> int:
     return addend - 4 - trailing
 
 
+def _reloc_width(kind: RelocKind) -> int:
+    return 8 if kind == RelocKind.ABS64 else 4
+
+
 class _Sec:
     def __init__(
         self,
@@ -64,7 +83,7 @@ class _Sec:
         info: int = 0,
         entsize: int = 0,
         addralign: int = 1,
-        size_override: int | None = None,
+        size_override: "int | None" = None,
     ) -> None:
         self.name = name
         self.sh_type = sh_type
@@ -77,11 +96,45 @@ class _Sec:
         self.size_override = size_override
 
 
+def _patched_sections(image: ObjectImage, implicit_addends: bool) -> "list[bytes]":
+    """Section bytes with AArch64 immediates cleared and, for REL, addends stored.
+
+    AArch64 keeps a relocation's value inside the instruction word. RELA
+    supplies the addend out of line, so the field is cleared here -- leaving the
+    original displacement would otherwise be read as an addend by anything that
+    does look at it.
+    """
+    bufs = [bytearray(s.data) for s in image.sections]
+    for r in image.relocs:
+        buf = bufs[r.section_index - 1]
+        if r.kind in AARCH64_KINDS:
+            if r.offset + 4 > len(buf):
+                raise ValueError(
+                    f"reloc offset {r.offset}+4 exceeds section {r.section_index} size {len(buf)}")
+            word = struct.unpack_from("<I", buf, r.offset)[0]
+            struct.pack_into("<I", buf, r.offset, aarch64.set_addend(word, r.kind, 0) & 0xFFFFFFFF)
+            continue
+        if not implicit_addends:
+            continue
+        w = _reloc_width(r.kind)
+        if r.offset + w > len(buf):
+            raise ValueError(
+                f"reloc offset {r.offset}+{w} exceeds section {r.section_index} size {len(buf)}")
+        value = _pcrel_addend(r.addend, r.trailing) if r.kind == RelocKind.PCREL32 else r.addend
+        mask = (1 << (w * 8)) - 1
+        struct.pack_into("<I" if w == 4 else "<Q", buf, r.offset, value & mask)
+    return [bytes(b) for b in bufs]
+
+
 def write_elf(image: ObjectImage) -> bytes:
     arch = image.arch
+    elf64 = arch != Arch.X86
+    # ELFCLASS32 objects use SHT_REL, whose addends live in the section bytes.
+    implicit_addends = not elf64
 
     shstr = _StrTab()
     strtab = _StrTab()
+    section_data = _patched_sections(image, implicit_addends)
 
     # ObjSection index i (1-based) -> ELF section index i (section 0 is null,
     # then the image sections follow in order at indices 1..N).
@@ -99,7 +152,11 @@ def write_elf(image: ObjectImage) -> bytes:
         sym_elf_index[orig_i] = new_i
 
     # Build .symtab.
-    symtab = bytearray(struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0))  # null symbol
+    sym_entsize = 24 if elf64 else 16
+    if elf64:
+        symtab = bytearray(struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0))  # null symbol
+    else:
+        symtab = bytearray(struct.pack("<IIIBBH", 0, 0, 0, 0, 0, 0))  # null symbol
     first_global = 1 + len(locals_)
     for orig_i, sym in sym_order:
         name_off = strtab.add(sym.name)
@@ -111,46 +168,57 @@ def write_elf(image: ObjectImage) -> bytes:
             value = sym.value
         typ = _STT_FUNC if sym.is_func else (_STT_NOTYPE if sym.section_index == 0 else _STT_OBJECT)
         info = (bind << 4) | typ
-        symtab += struct.pack("<IBBHQQ", name_off, info, 0, shndx, value, 0)
+        if elf64:
+            symtab += struct.pack("<IBBHQQ", name_off, info, 0, shndx, value, 0)
+        else:
+            symtab += struct.pack("<IIIBBH", name_off, value, 0, info, 0, shndx)
 
     # Assemble section list: null, then image sections, then .symtab,
-    # .strtab, one .rela.<name> per relocated section, and .shstrtab last.
+    # .strtab, one relocation section per relocated section, and .shstrtab last.
     secs: list[_Sec] = [_Sec("", 0, 0, b"")]  # null section
-    for sec in image.sections:
+    for i, sec in enumerate(image.sections):
         sh_type, flags = _SECTION_FLAGS[sec.kind]
         if sec.kind == ObjSectionKind.BSS:
             secs.append(_Sec(sec.name, sh_type, flags, b"", addralign=16, size_override=sec.bss_size))
         else:
-            secs.append(_Sec(sec.name, sh_type, flags, sec.data, addralign=16))
+            secs.append(_Sec(sec.name, sh_type, flags, section_data[i], addralign=16))
 
     symtab_index = len(secs)
     strtab_index = symtab_index + 1
     secs.append(
         _Sec(
             ".symtab", _SHT_SYMTAB, 0, bytes(symtab),
-            link=strtab_index, info=first_global, entsize=24, addralign=8,
+            link=strtab_index, info=first_global, entsize=sym_entsize,
+            addralign=8 if elf64 else 4,
         )
     )
     secs.append(_Sec(".strtab", _SHT_STRTAB, 0, strtab.data(), addralign=1))
 
-    # One .rela.<section> per relocated image section.
+    # One relocation section per relocated image section: .rela.<name> with
+    # explicit addends on ELFCLASS64, .rel.<name> on ELFCLASS32.
     reloc_by_section: dict[int, list] = {}
     for r in image.relocs:
         reloc_by_section.setdefault(r.section_index, []).append(r)
+    rel_entsize = 24 if elf64 else 8
+    rel_type = _SHT_RELA if elf64 else _SHT_REL
+    rel_prefix = ".rela" if elf64 else ".rel"
     for obj_sec_index, rs in sorted(reloc_by_section.items()):
         blob = bytearray()
         for r in rs:
             elf_sym = sym_elf_index[r.symbol_index]
             rtype = elf_reloc_type(arch, r.kind)
-            addend = _pcrel_addend(r.addend, r.trailing) if r.kind == RelocKind.PCREL32 else r.addend
-            r_info = (elf_sym << 32) | rtype
-            blob += struct.pack("<QQq", r.offset, r_info, addend)
+            if elf64:
+                addend = _pcrel_addend(r.addend, r.trailing) if r.kind == RelocKind.PCREL32 else r.addend
+                r_info = (elf_sym << 32) | rtype
+                blob += struct.pack("<QQq", r.offset, r_info, addend)
+            else:
+                blob += struct.pack("<II", r.offset, (elf_sym << 8) | rtype)
         target_name = image.sections[obj_sec_index - 1].name
         secs.append(
             _Sec(
-                ".rela" + target_name, _SHT_RELA, _SHF_INFO_LINK, bytes(blob),
+                rel_prefix + target_name, rel_type, _SHF_INFO_LINK, bytes(blob),
                 link=symtab_index, info=elf_index_of_obj[obj_sec_index],
-                entsize=24, addralign=8,
+                entsize=rel_entsize, addralign=8 if elf64 else 4,
             )
         )
 
@@ -163,10 +231,10 @@ def write_elf(image: ObjectImage) -> bytes:
     shstr.add(".shstrtab")
     secs[shstrtab_index].data = shstr.data()
 
-    # Lay out: ELF header (64 bytes) + no program headers, then section
-    # data (each aligned per its sh_addralign), then the section header table.
-    ehsize = 64
-    shentsize = 64
+    # Lay out: ELF header + no program headers, then section data (each aligned
+    # per its sh_addralign), then the section header table.
+    ehsize = 64 if elf64 else 52
+    shentsize = 64 if elf64 else 40
     offset = ehsize
     data_offsets: list[int] = []
     for s in secs:
@@ -178,28 +246,46 @@ def write_elf(image: ObjectImage) -> bytes:
             offset += align - (offset % align)
         data_offsets.append(offset)
         offset += len(s.data)
-    if offset % 8:
-        offset += 8 - (offset % 8)
+    tail_align = 8 if elf64 else 4
+    if offset % tail_align:
+        offset += tail_align - (offset % tail_align)
     shoff = offset
 
     out = bytearray()
-    e_ident = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 8
+    e_ident = b"\x7fELF" + bytes([_ELFCLASS64 if elf64 else _ELFCLASS32, 1, 1, 0]) + b"\x00" * 8
     out += e_ident
-    out += struct.pack(
-        "<HHIQQQIHHHHHH",
-        1,                    # e_type = ET_REL
-        elf_machine(arch),
-        1,                    # e_version
-        0,                    # e_entry
-        0,                    # e_phoff
-        shoff,
-        0,                    # e_flags
-        ehsize,
-        0, 0,                 # e_phentsize, e_phnum
-        shentsize,
-        len(secs),
-        shstrtab_index,       # e_shstrndx
-    )
+    if elf64:
+        out += struct.pack(
+            "<HHIQQQIHHHHHH",
+            1,                    # e_type = ET_REL
+            elf_machine(arch),
+            1,                    # e_version
+            0,                    # e_entry
+            0,                    # e_phoff
+            shoff,
+            0,                    # e_flags
+            ehsize,
+            0, 0,                 # e_phentsize, e_phnum
+            shentsize,
+            len(secs),
+            shstrtab_index,       # e_shstrndx
+        )
+    else:
+        out += struct.pack(
+            "<HHIIIIIHHHHHH",
+            1,                    # e_type = ET_REL
+            elf_machine(arch),
+            1,                    # e_version
+            0,                    # e_entry
+            0,                    # e_phoff
+            shoff,
+            0,                    # e_flags
+            ehsize,
+            0, 0,                 # e_phentsize, e_phnum
+            shentsize,
+            len(secs),
+            shstrtab_index,       # e_shstrndx
+        )
 
     # Section data.
     for i, s in enumerate(secs):
@@ -216,8 +302,7 @@ def write_elf(image: ObjectImage) -> bytes:
         name_off = shstr.add(s.name)
         size = s.size_override if s.size_override is not None else len(s.data)
         sh_offset = 0 if s.name == "" else data_offsets[i]
-        out += struct.pack(
-            "<IIQQQQIIQQ",
+        fields = (
             name_off,
             s.sh_type,
             s.flags,
@@ -229,4 +314,5 @@ def write_elf(image: ObjectImage) -> bytes:
             s.addralign,
             s.entsize,
         )
+        out += struct.pack("<IIQQQQIIQQ" if elf64 else "<IIIIIIIIII", *fields)
     return bytes(out)
